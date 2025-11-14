@@ -103,7 +103,7 @@ async def forward_incoming_message(message: dict):
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
-                "https://cc839cc1352c.ngrok-free.app/sms/reply",
+                os.environ.get("NGROK_URL"),
                 json=payload,
                 timeout=10.0
             )
@@ -133,10 +133,8 @@ async def watch_for_facetime_notifications():
             print(text)
             print("📞 FaceTime notification detected, restarting Messages…")
             await restart_messages()
-
-            message = ("Corn On The Corner, This is our storefront location: "
-                       "1041 Howard St, Dearborn, MI 48124. "
-                       "Please text your order including a name and confirm the given pick up time. Thank you.")
+            
+            message = "Corn On The Corner, This is our storefront location: 1041 Howard St, Dearborn, MI 48124. Please text your order including a name and confirm the given pick up time. Thank you."
             if outbound:
                 try:
                     coro = outbound.send_message("7345893340", message)
