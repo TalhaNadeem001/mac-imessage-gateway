@@ -20,10 +20,16 @@ from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 import httpx
 import uvicorn
+import time
+import re
+import asyncio
 
 from imessage_monitor.monitor import iMessageMonitor
 from imessage_monitor.outbound import OutboundMessageSender
 from imessage_monitor.exceptions import OutboundMessageError
+
+COOLDOWN = 10  # seconds
+cooldowns = {}  # {call_session_id: last_timestamp}
 
 
 # ================================================================
@@ -141,7 +147,7 @@ async def forward_incoming_message(message: dict):
 
     try:
         await HTTP.post(
-            "https://c4272991e20e.ngrok-free.app/sms/reply",
+            "https://kase-remunerable-kynlee.ngrok-free.dev/sms/reply",
             json=payload,
         )
         print(f"➡️ Forwarded inbound message from {sender}")
@@ -160,14 +166,24 @@ async def restart_messages():
     except subprocess.CalledProcessError as e:
         print(f"⚠️ AppleScript error: {e}")
 
-
 async def watch_for_facetime_notifications():
-    """Monitor unified log for FaceTime notifications."""
+    """Monitor unified log for FaceTime notifications with per-call cooldown."""
+    global cooldowns
+
     process = await asyncio.create_subprocess_shell(
         "log stream --predicate 'eventMessage contains \"FaceTime\"' --info",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    # Patterns to extract unique call identifiers from log output
+    id_patterns = [
+        r"call[-_ ]?id[: ]+([0-9a-f\-]+)",
+        r"call[-_ ]?uuid[: ]+([0-9a-f\-]+)",
+        r"uuid[: ]+([0-9a-f\-]+)",
+        r"id[: ]+([0-9a-fx]+)",
+        r"session[-_ ]?id[: ]+([0-9a-f\-]+)",
+    ]
 
     while True:
         line = await process.stdout.readline()
@@ -175,17 +191,45 @@ async def watch_for_facetime_notifications():
             break
 
         text = line.decode("utf-8", "ignore")
-        if "incoming" in text.lower():
-            print("📞 FaceTime incoming → restarting Messages")
-            await restart_messages()
 
-            # Automated response
-            await enqueue_send(
-                "7345893340",
-                "Corn On The Corner, This is our storefront location: "
-                "1041 Howard St, Dearborn, MI 48124. Please text your order "
-                "including a name and confirm the given pick up time. Thank you."
-            )
+        if "incoming" not in text.lower():
+            continue  # ignore non-incoming events
+
+        # Try to extract a unique call/session identifier
+        call_id = None
+        for pattern in id_patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                call_id = match.group(1)
+                break
+
+        # If nothing was found, fallback to hashing the log line
+        if not call_id:
+            call_id = f"fallback-{hash(text)}"
+
+        now = time.time()
+        last_event = cooldowns.get(call_id, 0)
+
+        # Apply per-call cooldown
+        if now - last_event < COOLDOWN:
+            # Same call still inside cooldown window → skip
+            continue
+
+        # Mark this call as handled
+        cooldowns[call_id] = now
+
+        print(f"📞 Incoming FaceTime (ID={call_id}) → restarting Messages")
+
+        # Restart Messages app
+        await restart_messages()
+
+        # Send your automated reply
+        await enqueue_send(
+            "7345893340",  # your store number
+            "Corn On The Corner, This is our storefront location: "
+            "1041 Howard St, Dearborn, MI 48124. Please text your order "
+            "including a name and confirm the given pick up time. Thank you."
+        )
 
 
 # ================================================================
