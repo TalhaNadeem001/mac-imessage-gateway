@@ -77,6 +77,44 @@ do shell script "
 "
 '''
 
+APPLE_DECLINE_ONLY = '''
+use AppleScript version "2.4"
+use scripting additions
+
+tell application "System Events"
+    tell process "NotificationCenter"
+        try
+            set callWindow to (first window whose (exists button "Decline") and (exists button "Accept"))
+
+            set callerName to ""
+            try
+                if exists static text 1 of callWindow then
+                    set callerName to value of static text 1 of callWindow
+                end if
+            end try
+
+            try
+                if callerName is "" then
+                    set callerName to value of static text 1 of group 1 of UI element 1 of scroll area 1 of callWindow
+                end if
+            end try
+
+            click button "Decline" of callWindow
+
+            if callerName is not "" then
+                display notification "Declined call from " & callerName with title "Call Auto-Declined"
+            else
+                display notification "Call declined" with title "Call Auto-Declined"
+            end if
+
+        on error errMsg
+            display alert "No active incoming call notification found." message ("Error: " & errMsg)
+        end try
+    end tell
+end tell
+'''
+
+
 
 # ================================================================
 #                  AUTH
@@ -147,7 +185,7 @@ async def forward_incoming_message(message: dict):
 
     try:
         await HTTP.post(
-            "https://kase-remunerable-kynlee.ngrok-free.dev/sms/reply",
+            "https://zappd.ngrok.app/sms/reply",
             json=payload,
         )
         print(f"➡️ Forwarded inbound message from {sender}")
@@ -165,6 +203,19 @@ async def restart_messages():
         print("🔄 Messages app restarted")
     except subprocess.CalledProcessError as e:
         print(f"⚠️ AppleScript error: {e}")
+
+async def run_auto_decline_applescript():
+    process = await asyncio.create_subprocess_exec(
+        "osascript", "-e", APPLE_DECLINE_ONLY,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if stdout:
+        print("📟 AppleScript output:", stdout.decode())
+    if stderr:
+        print("⚠️ AppleScript error:", stderr.decode())
 
 async def watch_for_facetime_notifications():
     """Monitor unified log for FaceTime notifications with per-call cooldown."""
@@ -221,7 +272,9 @@ async def watch_for_facetime_notifications():
         print(f"📞 Incoming FaceTime (ID={call_id}) → restarting Messages")
 
         # Restart Messages app
+        await run_auto_decline_applescript()
         await restart_messages()
+
 
         # Send your automated reply
         await enqueue_send(
