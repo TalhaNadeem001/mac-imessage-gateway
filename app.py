@@ -23,13 +23,19 @@ import uvicorn
 import time
 import re
 import asyncio
+import hashlib
 
 from imessage_monitor.monitor import iMessageMonitor
 from imessage_monitor.outbound import OutboundMessageSender
 from imessage_monitor.exceptions import OutboundMessageError
 
-COOLDOWN = 10  # seconds
-cooldowns = {}  # {call_session_id: last_timestamp}
+
+COOLDOWN = 20  # per-call cooldown
+GLOBAL_DEBOUNCE = 2  # prevent burst duplicates
+cooldowns = {}
+last_global = 0
+
+UUID_REGEX = r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
 
 
 # ================================================================
@@ -185,7 +191,7 @@ async def forward_incoming_message(message: dict):
 
     try:
         await HTTP.post(
-            "https://zappd.ngrok.app/sms/reply",
+            "https://zappd.app/sms/reply",
             json=payload,
         )
         print(f"➡️ Forwarded inbound message from {sender}")
@@ -218,23 +224,13 @@ async def run_auto_decline_applescript():
         print("⚠️ AppleScript error:", stderr.decode())
 
 async def watch_for_facetime_notifications():
-    """Monitor unified log for FaceTime notifications with per-call cooldown."""
-    global cooldowns
+    global cooldowns, last_global
 
     process = await asyncio.create_subprocess_shell(
         "log stream --predicate 'eventMessage contains \"FaceTime\"' --info",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-
-    # Patterns to extract unique call identifiers from log output
-    id_patterns = [
-        r"call[-_ ]?id[: ]+([0-9a-f\-]+)",
-        r"call[-_ ]?uuid[: ]+([0-9a-f\-]+)",
-        r"uuid[: ]+([0-9a-f\-]+)",
-        r"id[: ]+([0-9a-fx]+)",
-        r"session[-_ ]?id[: ]+([0-9a-f\-]+)",
-    ]
 
     while True:
         line = await process.stdout.readline()
@@ -244,41 +240,37 @@ async def watch_for_facetime_notifications():
         text = line.decode("utf-8", "ignore")
 
         if "incoming" not in text.lower():
-            continue  # ignore non-incoming events
-
-        # Try to extract a unique call/session identifier
-        call_id = None
-        for pattern in id_patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                call_id = match.group(1)
-                break
-
-        # If nothing was found, fallback to hashing the log line
-        if not call_id:
-            call_id = f"fallback-{hash(text)}"
-
-        now = time.time()
-        last_event = cooldowns.get(call_id, 0)
-
-        # Apply per-call cooldown
-        if now - last_event < COOLDOWN:
-            # Same call still inside cooldown window → skip
             continue
 
-        # Mark this call as handled
+        # ---- Unified UUID extraction ----
+        match = re.search(UUID_REGEX, text)
+        if match:
+            call_id = match.group(0).replace("-", "")
+        else:
+            # Stable fallback
+            call_id = "fallback-" + hashlib.sha1(text.encode()).hexdigest()[:12]
+
+        now = time.time()
+
+        # ---- Global debounce ----
+        if now - last_global < GLOBAL_DEBOUNCE:
+            continue
+        last_global = now
+
+        # ---- Per-call cooldown ----
+        last_event = cooldowns.get(call_id, 0)
+        if now - last_event < COOLDOWN:
+            print("⚠️ Duplicate prevented (cooldown):", call_id)
+            continue
+
         cooldowns[call_id] = now
 
         print(f"📞 Incoming FaceTime (ID={call_id}) → restarting Messages")
 
-        # Restart Messages app
-        await run_auto_decline_applescript()
         await restart_messages()
 
-
-        # Send your automated reply
         await enqueue_send(
-            "7345893340",  # your store number
+            "7345893340",
             "Corn On The Corner, This is our storefront location: "
             "1041 Howard St, Dearborn, MI 48124. Please text your order "
             "including a name and confirm the given pick up time. Thank you."
@@ -299,6 +291,8 @@ async def startup_event():
     outbound = OutboundMessageSender(monitor.config)
 
     # Register inbound callback
+    # Monitor is always checking the OS to see if a message is recieved
+    # If recieved will send to application
     monitor.start(
         message_callback=lambda msg: loop.create_task(
             forward_incoming_message(msg)
@@ -329,6 +323,8 @@ async def shutdown_event():
 
 @app.post("/send")
 async def send_message(req: SendRequest):
+    # Recieves message from application and puts it in a queue
+    # macOS is responsible for sending messages
     await enqueue_send(req.to, req.message)
     return {"status": "queued", "to": req.to}
 
