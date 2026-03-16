@@ -1,3 +1,4 @@
 .qodo
 __pycache__
 myenv
+.env
