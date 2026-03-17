@@ -29,6 +29,9 @@ from imessage_monitor.monitor import iMessageMonitor
 from imessage_monitor.outbound import OutboundMessageSender
 from imessage_monitor.exceptions import OutboundMessageError
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 COOLDOWN = 20  # per-call cooldown
 GLOBAL_DEBOUNCE = 2  # prevent burst duplicates
@@ -69,6 +72,7 @@ SEND_QUEUE: asyncio.Queue = asyncio.Queue()
 HTTP = httpx.AsyncClient(timeout=10)
 
 API_KEY = os.environ.get("IMESSAGE_API_KEY", "changeme")
+USER_ID = os.environ.get("IMESSAGE_USER_ID")
 
 APPLE_SCRIPT = '''
 set appName to "FaceTime"
@@ -187,6 +191,7 @@ async def forward_incoming_message(message: dict):
             or message.get("decoded_attributed_body")
             or ""
         ),
+        "userId": USER_ID,
     }
 
     try:
@@ -270,7 +275,7 @@ async def watch_for_facetime_notifications():
         await restart_messages()
 
         await enqueue_send(
-            "7345893340",
+            "",
             "Corn On The Corner, This is our storefront location: "
             "1041 Howard St, Dearborn, MI 48124. Please text your order "
             "including a name and confirm the given pick up time. Thank you."
@@ -300,7 +305,6 @@ async def startup_event():
     )
 
     asyncio.create_task(send_worker(outbound))
-    asyncio.create_task(watch_for_facetime_notifications())
 
     print("✅ iMessage monitor started")
     print("🚀 Outbound queue worker running")
