@@ -15,6 +15,7 @@ import os
 import asyncio
 import subprocess
 from typing import Optional, Annotated
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
@@ -200,6 +201,14 @@ async def forward_incoming_message(message: dict):
             json=payload,
         )
         print(f"➡️ Forwarded inbound message from {sender}")
+        from message_audit import store_message
+
+        # AFTER successful HTTP forward
+        store_message(
+            sender=sender,
+            body=payload["Body"],
+            guid=message.get("guid"),
+        )
     except Exception as e:
         print(f"⚠️ Failed to forward inbound message: {e}")
 
@@ -324,6 +333,15 @@ async def shutdown_event():
 # ================================================================
 #                  API ROUTES
 # ================================================================
+
+@app.get("/")
+async def home():
+    return {
+        "status": "ok",
+        "service": "zappd_node",
+        "uptime": "running",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 @app.post("/send")
 async def send_message(req: SendRequest):

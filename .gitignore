@@ -2,3 +2,8 @@
 __pycache__
 myenv
 .env
+.venv
+chat.db
+forwarded_messages.db
+__pycache__/*
+.env
