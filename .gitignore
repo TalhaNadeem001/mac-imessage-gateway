@@ -7,3 +7,4 @@ chat.db
 forwarded_messages.db
 __pycache__/*
 .env
+.env

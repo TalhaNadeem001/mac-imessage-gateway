@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import asyncio
 import subprocess
+import shutil
 from typing import Optional, Annotated
 from datetime import datetime
 
@@ -147,12 +148,51 @@ async def require_api_key(request: Request):
 #                  OUTBOUND QUEUE WORKER
 # ================================================================
 
+def _escape_applescript_string(value: str) -> str:
+    # AppleScript strings are double-quoted; escape backslashes + quotes.
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+async def send_message_via_osascript(to: str, message: str) -> None:
+    """
+    Send an iMessage via the macOS Messages.app using osascript.
+
+    Equivalent to:
+      osascript <<EOF
+      tell application "Messages"
+          send "hello" to buddy "+123..."
+      end tell
+      EOF
+    """
+    if not shutil.which("osascript"):
+        raise RuntimeError("osascript not found. This sender requires macOS.")
+
+    script = (
+        'tell application "Messages"\n'
+        f'    send "{_escape_applescript_string(message)}" to buddy "{_escape_applescript_string(to)}"\n'
+        "end tell\n"
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        "osascript",
+        "-e",
+        script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        details = (stderr or stdout or b"").decode("utf-8", "ignore").strip()
+        raise OutboundMessageError(details or f"osascript failed with exit code {process.returncode}")
+
+
 async def send_worker(outbound: OutboundMessageSender):
     """Single worker that processes SEND_QUEUE sequentially."""
     while True:
         to, message = await SEND_QUEUE.get()
         try:
-            await outbound.send_message(to, message)
+            await send_message_via_osascript(to, message)
             print(f"📤 Sent message to {to}")
         except OutboundMessageError as exc:
             print(f"❌ OutboundMessageError sending to {to}: {exc}")
@@ -360,3 +400,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("IMESSAGE_PORT", "8000"))
     print(f"Starting on http://{host}:{port}")
     uvicorn.run("app:app", host=host, port=port, log_level="info")
+    
