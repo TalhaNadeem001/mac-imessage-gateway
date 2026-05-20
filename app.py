@@ -237,7 +237,7 @@ async def forward_incoming_message(message: dict):
 
     try:
         await HTTP.post(
-            "https://zappd.app/sms/reply",
+           os.environ.get("FWD_URL", "https://zappd.app/sms/reply"),
             json=payload,
         )
         print(f"➡️ Forwarded inbound message from {sender}")

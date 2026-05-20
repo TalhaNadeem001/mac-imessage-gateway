@@ -8,3 +8,12 @@ forwarded_messages.db
 __pycache__/*
 .env
 .env
+.env
+messages_by_user.json
+
+
+messages_last_24h.json
+__pycache__/*
+avg_time.py
+cleanup.py
+dump.py
