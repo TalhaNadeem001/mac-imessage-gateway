@@ -16,6 +16,7 @@ import asyncio
 import subprocess
 import shutil
 from typing import Optional, Annotated
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -75,6 +76,10 @@ HTTP = httpx.AsyncClient(timeout=10)
 
 API_KEY = os.environ.get("IMESSAGE_API_KEY", "changeme")
 USER_ID = os.environ.get("IMESSAGE_USER_ID")
+FWD_URL = os.environ.get("FWD_URL", "https://zappd.app/sms/reply")
+INBOUND_BATCH_DELAY_SECONDS = float(
+    os.environ.get("INBOUND_BATCH_DELAY_SECONDS", "0")
+)
 
 APPLE_SCRIPT = '''
 set appName to "FaceTime"
@@ -211,46 +216,115 @@ async def enqueue_send(to: str, message: str):
 #                  INBOUND FORWARDING
 # ================================================================
 
+def _message_body(message: dict) -> str:
+    return (
+        message.get("message_text")
+        or message.get("decoded_attributed_body")
+        or ""
+    )
+
+
+def _sender_key(message: dict) -> Optional[str]:
+    return (
+        message.get("handle_id_str")
+        or message.get("uncanonicalized_id")
+        or message.get("chat_identifier")
+    )
+
+
+@dataclass
+class _SenderBatch:
+    messages: list[dict] = field(default_factory=list)
+    flush_task: Optional[asyncio.Task] = None
+
+
+_inbound_batches: dict[str, _SenderBatch] = {}
+_inbound_batches_lock = asyncio.Lock()
+
+
+async def _post_forward_payload(payload: dict, sender: str, audit_messages: list[dict]) -> None:
+    await HTTP.post(FWD_URL, json=payload)
+    print(f"➡️ Forwarded inbound message from {sender}")
+    from message_audit import store_message
+
+    for message in audit_messages:
+        store_message(
+            sender=sender,
+            body=_message_body(message),
+            guid=message.get("guid"),
+        )
+
+
+async def _forward_messages_now(messages: list[dict], sender: str) -> None:
+    if not messages:
+        return
+
+    last = messages[-1]
+    bodies = [_message_body(m) for m in messages]
+    combined_body = "\n".join(b for b in bodies if b)
+
+    payload = {
+        "From": sender,
+        "To": last.get("chat_identifier") or "unknown",
+        "Body": combined_body,
+        "userId": USER_ID,
+    }
+
+    try:
+        await _post_forward_payload(payload, sender, messages)
+    except Exception as e:
+        print(f"⚠️ Failed to forward inbound message: {e}")
+
+
+async def _flush_sender_batch_after_delay(sender: str) -> None:
+    try:
+        await asyncio.sleep(INBOUND_BATCH_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with _inbound_batches_lock:
+        batch = _inbound_batches.pop(sender, None)
+    if batch and batch.messages:
+        await _forward_messages_now(batch.messages, sender)
+
+
+async def _enqueue_inbound_batch(message: dict, sender: str) -> None:
+    async with _inbound_batches_lock:
+        batch = _inbound_batches.setdefault(sender, _SenderBatch())
+        batch.messages.append(message)
+        if batch.flush_task and not batch.flush_task.done():
+            batch.flush_task.cancel()
+        batch.flush_task = asyncio.create_task(
+            _flush_sender_batch_after_delay(sender)
+        )
+
+
+async def flush_all_inbound_batches() -> None:
+    async with _inbound_batches_lock:
+        pending = dict(_inbound_batches)
+        _inbound_batches.clear()
+
+    for sender, batch in pending.items():
+        if batch.flush_task and not batch.flush_task.done():
+            batch.flush_task.cancel()
+        if batch.messages:
+            await _forward_messages_now(batch.messages, sender)
+
+
 async def forward_incoming_message(message: dict):
     """Forward inbound iMessage data to ngrok endpoint."""
     if message.get("is_from_me"):
         return
 
-    sender = (
-        message.get("handle_id_str")
-        or message.get("uncanonicalized_id")
-        or message.get("chat_identifier")
-    )
+    sender = _sender_key(message)
     if not sender:
         return
 
-    payload = {
-        "From": sender,
-        "To": message.get("chat_identifier") or "unknown",
-        "Body": (
-            message.get("message_text")
-            or message.get("decoded_attributed_body")
-            or ""
-        ),
-        "userId": USER_ID,
-    }
+    if INBOUND_BATCH_DELAY_SECONDS <= 0:
+        await _forward_messages_now([message], sender)
+        return
 
-    try:
-        await HTTP.post(
-           os.environ.get("FWD_URL", "https://zappd.app/sms/reply"),
-            json=payload,
-        )
-        print(f"➡️ Forwarded inbound message from {sender}")
-        from message_audit import store_message
-
-        # AFTER successful HTTP forward
-        store_message(
-            sender=sender,
-            body=payload["Body"],
-            guid=message.get("guid"),
-        )
-    except Exception as e:
-        print(f"⚠️ Failed to forward inbound message: {e}")
+    await _enqueue_inbound_batch(message, sender)
 
 
 # ================================================================
@@ -358,11 +432,16 @@ async def startup_event():
     print("✅ iMessage monitor started")
     print("🚀 Outbound queue worker running")
     print("📞 FaceTime watcher started")
+    if INBOUND_BATCH_DELAY_SECONDS > 0:
+        print(
+            f"📥 Inbound batch delay: {INBOUND_BATCH_DELAY_SECONDS}s per sender"
+        )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global monitor
+    await flush_all_inbound_batches()
     try:
         if monitor:
             monitor.stop()
