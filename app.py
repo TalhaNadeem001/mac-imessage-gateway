@@ -6,6 +6,7 @@ Includes:
  - Unified async send worker
  - Shared httpx client
  - Simplified inbound forwarding
+ - Local SQLite staging for outbound sync to ORDERFLOW
  - Clean FaceTime watcher & restart logic
 """
 
@@ -26,7 +27,6 @@ import httpx
 import uvicorn
 import time
 import re
-import asyncio
 import hashlib
 
 from imessage_monitor.monitor import iMessageMonitor
@@ -34,6 +34,9 @@ from imessage_monitor.outbound import OutboundMessageSender
 from imessage_monitor.exceptions import OutboundMessageError
 
 from dotenv import load_dotenv
+
+import message_store
+
 load_dotenv()
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -88,6 +91,14 @@ FWD_URL = os.environ.get("FWD_URL", "https://zappd.app/sms/reply")
 INBOUND_BATCH_DELAY_SECONDS = float(
     os.environ.get("INBOUND_BATCH_DELAY_SECONDS", "0")
 )
+EDIT_POLL_INTERVAL_SECONDS = float(
+    os.environ.get("EDIT_POLL_INTERVAL_SECONDS", "2")
+)
+EDIT_POLL_LIMIT = int(os.environ.get("EDIT_POLL_LIMIT", "80"))
+OUTBOUND_MATCH_WINDOW_SECONDS = int(
+    os.environ.get("OUTBOUND_MATCH_WINDOW_SECONDS", "300")
+)
+IMESSAGE_DB_PATH = os.environ.get("IMESSAGE_DB_PATH")
 
 APPLE_SCRIPT = '''
 set appName to "FaceTime"
@@ -140,7 +151,6 @@ end tell
 '''
 
 
-
 # ================================================================
 #                  AUTH
 # ================================================================
@@ -162,21 +172,10 @@ async def require_api_key(request: Request):
 # ================================================================
 
 def _escape_applescript_string(value: str) -> str:
-    # AppleScript strings are double-quoted; escape backslashes + quotes.
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 async def send_message_via_osascript(to: str, message: str) -> None:
-    """
-    Send an iMessage via the macOS Messages.app using osascript.
-
-    Equivalent to:
-      osascript <<EOF
-      tell application "Messages"
-          send "hello" to buddy "+123..."
-      end tell
-      EOF
-    """
     if not shutil.which("osascript"):
         raise RuntimeError("osascript not found. This sender requires macOS.")
 
@@ -201,7 +200,6 @@ async def send_message_via_osascript(to: str, message: str) -> None:
 
 
 async def send_worker(outbound: OutboundMessageSender):
-    """Single worker that processes SEND_QUEUE sequentially."""
     while True:
         to, message = await SEND_QUEUE.get()
         try:
@@ -216,20 +214,37 @@ async def send_worker(outbound: OutboundMessageSender):
 
 
 async def enqueue_send(to: str, message: str):
-    """Public helper to submit outgoing messages."""
     await SEND_QUEUE.put((to, message))
 
 
 # ================================================================
-#                  INBOUND FORWARDING
+#                  MESSAGE HELPERS
 # ================================================================
+
+_known_bodies: dict[str, str] = {}
+_forwarded_guids: set[str] = set()
+_seen_guids: set[str] = set()
+_edit_poll_running = False
+
 
 def _message_body(message: dict) -> str:
     return (
         message.get("message_text")
         or message.get("decoded_attributed_body")
         or ""
-    )
+    ).strip()
+
+
+def _normalize_guid(guid: str) -> str:
+    return guid.strip().lower()
+
+
+def _message_guid(message: dict) -> Optional[str]:
+    raw = message.get("message_guid") or message.get("guid")
+    if not raw or not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    return _normalize_guid(trimmed) if trimmed else None
 
 
 def _sender_key(message: dict) -> Optional[str]:
@@ -240,9 +255,49 @@ def _sender_key(message: dict) -> Optional[str]:
     )
 
 
+def _customer_peer(message: dict) -> Optional[str]:
+    return _sender_key(message) or message.get("chat_identifier")
+
+
+# ================================================================
+#                  SQLITE SYNC
+# ================================================================
+
+async def _run_store(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def sync_message_to_sqlite(message: dict) -> None:
+    guid = _message_guid(message)
+    body = _message_body(message)
+    if not guid or not body:
+        return
+
+    peer = _customer_peer(message)
+    if not peer:
+        return
+
+    is_from_me = bool(message.get("is_from_me"))
+    sender = "cashier" if is_from_me else "customer"
+    await _run_store(
+        message_store.upsert_mirror,
+        guid=guid,
+        body=body,
+        peer=peer,
+        sender=sender,
+        is_from_me=is_from_me,
+        status="synced" if is_from_me else "received",
+    )
+
+
+# ================================================================
+#                  INBOUND / OUTBOUND FORWARDING
+# ================================================================
+
 @dataclass
 class _SenderBatch:
-    messages: list[dict] = field(default_factory=list)
+    messages_by_guid: dict[str, dict] = field(default_factory=dict)
+    order: list[str] = field(default_factory=list)
     flush_task: Optional[asyncio.Task] = None
 
 
@@ -250,61 +305,202 @@ _inbound_batches: dict[str, _SenderBatch] = {}
 _inbound_batches_lock = asyncio.Lock()
 
 
-async def _post_forward_payload(payload: dict, sender: str, audit_messages: list[dict]) -> None:
-    await HTTP.post(FWD_URL, json=payload)
-    logger.info("Forwarded inbound message from %s", sender)
-    from message_audit import store_message
+def _batch_messages_in_order(batch: _SenderBatch) -> list[dict]:
+    return [batch.messages_by_guid[g] for g in batch.order if g in batch.messages_by_guid]
 
-    for message in audit_messages:
-        store_message(
-            sender=sender,
-            body=_message_body(message),
-            guid=message.get("guid"),
+
+def _remember_body(message: dict) -> None:
+    guid = _message_guid(message)
+    if guid:
+        _known_bodies[guid] = _message_body(message)
+
+
+def _mark_messages_forwarded(messages: list[dict]) -> None:
+    for message in messages:
+        guid = _message_guid(message)
+        if guid:
+            _forwarded_guids.add(guid)
+            _known_bodies[guid] = _message_body(message)
+
+
+def _build_inbound_payload(customer: str, message: dict) -> dict:
+    guid = _message_guid(message)
+    if not guid:
+        raise ValueError("message missing guid")
+    return {
+        "From": customer,
+        "To": message.get("chat_identifier") or "unknown",
+        "Body": _message_body(message),
+        "userId": USER_ID,
+        "messageId": guid,
+        "sender": "customer",
+    }
+
+
+def _build_edit_payload(customer: str, message: dict) -> dict:
+    guid = _message_guid(message)
+    if not guid:
+        raise ValueError("message missing guid")
+    return {
+        "From": customer,
+        "To": message.get("chat_identifier") or "unknown",
+        "Body": _message_body(message),
+        "userId": USER_ID,
+        "messageId": guid,
+        "sender": "customer",
+        "edit": True,
+    }
+
+
+def _build_outbound_payload(customer: str, message: dict) -> dict:
+    guid = _message_guid(message)
+    if not guid:
+        raise ValueError("message missing guid")
+    return {
+        "From": customer,
+        "To": message.get("chat_identifier") or "unknown",
+        "Body": _message_body(message),
+        "userId": USER_ID,
+        "messageId": guid,
+        "sender": "cashier",
+    }
+
+
+async def _post_forward_payload(
+    payload: dict,
+    log_label: str,
+    *,
+    is_edit: bool = False,
+) -> None:
+    guid = payload.get("messageId")
+    kind = "edit" if is_edit else payload.get("sender", "message")
+    try:
+        response = await HTTP.post(FWD_URL, json=payload)
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+        action = data.get("action")
+        message_id = data.get("messageId")
+        if action or message_id:
+            logger.info(
+                "Forwarded %s %s guid=%s ORDERFLOW action=%s messageId=%s",
+                kind,
+                log_label,
+                guid,
+                action,
+                message_id,
+            )
+        else:
+            logger.info("Forwarded %s %s guid=%s", kind, log_label, guid)
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:500] if e.response is not None else ""
+        logger.warning(
+            "ORDERFLOW rejected %s guid=%s status=%s body=%s",
+            kind,
+            guid,
+            e.response.status_code if e.response else "?",
+            body,
         )
+        if guid:
+            await _run_store(message_store.mark_failed, guid)
+        raise
+    except Exception as e:
+        logger.warning("Failed to POST %s guid=%s to %s: %s", kind, guid, FWD_URL, e)
+        if guid:
+            await _run_store(message_store.mark_failed, guid)
+        raise
+
+    if guid:
+        _forwarded_guids.add(guid)
+        await _run_store(message_store.mark_synced, guid)
 
 
-async def _forward_messages_now(messages: list[dict], sender: str) -> None:
+async def forward_outbound_to_orderflow(message: dict, customer: str) -> None:
+    guid = _message_guid(message)
+    if not guid:
+        logger.warning("Outbound message missing guid; skipping ORDERFLOW sync")
+        return
+
+    if await _run_store(message_store.should_skip_outbound_forward, guid):
+        logger.info(
+            "Skipping ORDERFLOW sync for guid=%s (already in local DB)",
+            guid,
+        )
+        return
+
+    if not USER_ID:
+        logger.error("IMESSAGE_USER_ID not set; cannot sync outbound guid=%s", guid)
+        return
+
+    try:
+        payload = _build_outbound_payload(customer, message)
+        await _post_forward_payload(payload, f"to {customer}")
+    except Exception as e:
+        logger.warning("Failed to sync outbound guid=%s to ORDERFLOW: %s", guid, e)
+
+
+async def _forward_messages_now(messages: list[dict], customer: str) -> None:
     if not messages:
         return
 
-    last = messages[-1]
-    bodies = [_message_body(m) for m in messages]
-    combined_body = "\n".join(b for b in bodies if b)
+    for message in messages:
+        guid = _message_guid(message)
+        if not guid:
+            logger.warning("Inbound message missing guid; skipping forward")
+            continue
+        try:
+            payload = _build_inbound_payload(customer, message)
+            await _post_forward_payload(payload, f"from {customer}")
+            _mark_messages_forwarded([message])
+        except Exception as e:
+            logger.warning("Failed to forward inbound guid=%s: %s", guid, e)
 
-    payload = {
-        "From": sender,
-        "To": last.get("chat_identifier") or "unknown",
-        "Body": combined_body,
-        "userId": USER_ID,
-    }
 
+async def _forward_edit(message: dict, customer: str) -> None:
+    guid = _message_guid(message)
+    if not guid:
+        return
+    payload = _build_edit_payload(customer, message)
     try:
-        await _post_forward_payload(payload, sender, messages)
+        await _post_forward_payload(payload, f"from {customer}", is_edit=True)
+        _known_bodies[guid] = _message_body(message)
+        logger.info("Forwarded edit guid=%s from %s", guid, customer)
     except Exception as e:
-        logger.warning("Failed to forward inbound message: %s", e)
+        logger.warning("Failed to forward edit guid=%s: %s", guid, e)
 
 
-async def _flush_sender_batch_after_delay(sender: str) -> None:
+async def _flush_sender_batch_after_delay(customer: str) -> None:
     try:
         await asyncio.sleep(INBOUND_BATCH_DELAY_SECONDS)
     except asyncio.CancelledError:
         return
 
     async with _inbound_batches_lock:
-        batch = _inbound_batches.pop(sender, None)
-    if batch and batch.messages:
-        await _forward_messages_now(batch.messages, sender)
+        batch = _inbound_batches.pop(customer, None)
+    if batch and batch.messages_by_guid:
+        await _forward_messages_now(_batch_messages_in_order(batch), customer)
 
 
-async def _enqueue_inbound_batch(message: dict, sender: str) -> None:
+async def _enqueue_inbound_batch(message: dict, customer: str) -> None:
+    guid = _message_guid(message)
+    if not guid:
+        logger.warning("Inbound message missing guid; skipping batch")
+        return
+
     async with _inbound_batches_lock:
-        batch = _inbound_batches.setdefault(sender, _SenderBatch())
-        batch.messages.append(message)
+        batch = _inbound_batches.setdefault(customer, _SenderBatch())
+        if guid not in batch.messages_by_guid:
+            batch.order.append(guid)
+        batch.messages_by_guid[guid] = message
         if batch.flush_task and not batch.flush_task.done():
             batch.flush_task.cancel()
         batch.flush_task = asyncio.create_task(
-            _flush_sender_batch_after_delay(sender)
+            _flush_sender_batch_after_delay(customer)
         )
+    _remember_body(message)
+    _seen_guids.add(guid)
 
 
 async def flush_all_inbound_batches() -> None:
@@ -312,27 +508,151 @@ async def flush_all_inbound_batches() -> None:
         pending = dict(_inbound_batches)
         _inbound_batches.clear()
 
-    for sender, batch in pending.items():
+    for customer, batch in pending.items():
         if batch.flush_task and not batch.flush_task.done():
             batch.flush_task.cancel()
-        if batch.messages:
-            await _forward_messages_now(batch.messages, sender)
+        if batch.messages_by_guid:
+            await _forward_messages_now(_batch_messages_in_order(batch), customer)
+
+
+async def _update_pending_edit(message: dict, customer: str) -> bool:
+    guid = _message_guid(message)
+    if not guid:
+        return False
+
+    async with _inbound_batches_lock:
+        batch = _inbound_batches.get(customer)
+        if not batch or guid not in batch.messages_by_guid:
+            return False
+        batch.messages_by_guid[guid] = message
+        if batch.flush_task and not batch.flush_task.done():
+            batch.flush_task.cancel()
+        batch.flush_task = asyncio.create_task(
+            _flush_sender_batch_after_delay(customer)
+        )
+    _known_bodies[guid] = _message_body(message)
+    logger.info("Coalesced edit into pending batch guid=%s customer=%s", guid, customer)
+    return True
+
+
+async def _process_edit_poll_message(message: dict) -> None:
+    if message.get("is_from_me"):
+        await sync_message_to_sqlite(message)
+        return
+
+    guid = _message_guid(message)
+    if not guid:
+        return
+
+    body = _message_body(message)
+    if _known_bodies.get(guid) == body:
+        return
+
+    customer = _sender_key(message)
+    if not customer:
+        return
+
+    pending_customer: Optional[str] = None
+    async with _inbound_batches_lock:
+        for batch_customer, batch in _inbound_batches.items():
+            if guid in batch.messages_by_guid:
+                pending_customer = batch_customer
+                break
+
+    if pending_customer:
+        await _update_pending_edit(message, pending_customer)
+        return
+
+    if guid in _forwarded_guids:
+        await _forward_edit(message, customer)
+        return
+
+    _known_bodies[guid] = body
+    if guid not in _seen_guids:
+        _seen_guids.add(guid)
+        await forward_incoming_message(message)
+
+
+def _seed_recent_messages(mon: iMessageMonitor) -> None:
+    loop = asyncio.get_event_loop()
+    for message in mon.get_recent_messages(EDIT_POLL_LIMIT):
+        guid = _message_guid(message)
+        if not guid:
+            continue
+        _seen_guids.add(guid)
+        _known_bodies[guid] = _message_body(message)
+        if _message_body(message) and _customer_peer(message):
+            loop.create_task(sync_message_to_sqlite(message))
+
+
+async def _edit_poll_loop() -> None:
+    global _edit_poll_running
+    _edit_poll_running = True
+    while _edit_poll_running:
+        await asyncio.sleep(EDIT_POLL_INTERVAL_SECONDS)
+        if not monitor:
+            continue
+        try:
+            messages = await asyncio.to_thread(
+                monitor.get_recent_messages, EDIT_POLL_LIMIT
+            )
+        except Exception as e:
+            logger.warning("Edit poll failed: %s", e)
+            continue
+        for message in messages:
+            await _process_edit_poll_message(message)
+
+
+async def handle_monitor_message(message: dict) -> None:
+    if message.get("is_from_me"):
+        guid = _message_guid(message)
+        body = _message_body(message)
+        customer = _customer_peer(message)
+        if not guid or not body or not customer:
+            return
+
+        pending = await _run_store(
+            message_store.find_pending_outbound,
+            peer=customer,
+            body=body,
+            max_age_seconds=OUTBOUND_MATCH_WINDOW_SECONDS,
+        )
+        if pending:
+            await _run_store(message_store.attach_guid, pending["id"], guid)
+            logger.info(
+                "Matched pending /send row id=%s to guid=%s customer=%s (local only, no /sms/reply)",
+                pending["id"],
+                guid,
+                customer,
+            )
+            return
+
+        await sync_message_to_sqlite(message)
+        await forward_outbound_to_orderflow(message, customer)
+        return
+
+    await sync_message_to_sqlite(message)
+    await forward_incoming_message(message)
 
 
 async def forward_incoming_message(message: dict):
-    """Forward inbound iMessage data to ngrok endpoint."""
     if message.get("is_from_me"):
         return
 
-    sender = _sender_key(message)
-    if not sender:
+    customer = _sender_key(message)
+    if not customer:
         return
+
+    guid = _message_guid(message)
+    if guid:
+        _seen_guids.add(guid)
+        _remember_body(message)
 
     if INBOUND_BATCH_DELAY_SECONDS <= 0:
-        await _forward_messages_now([message], sender)
+        await _forward_messages_now([message], customer)
         return
 
-    await _enqueue_inbound_batch(message, sender)
+    await _enqueue_inbound_batch(message, customer)
 
 
 # ================================================================
@@ -346,6 +666,7 @@ async def restart_messages():
     except subprocess.CalledProcessError as e:
         logger.warning("AppleScript error: %s", e)
 
+
 async def run_auto_decline_applescript():
     process = await asyncio.create_subprocess_exec(
         "osascript", "-e", APPLE_DECLINE_ONLY,
@@ -358,6 +679,7 @@ async def run_auto_decline_applescript():
         logger.debug("AppleScript output: %s", stdout.decode())
     if stderr:
         logger.warning("AppleScript stderr: %s", stderr.decode())
+
 
 async def watch_for_facetime_notifications():
     global cooldowns, last_global
@@ -378,22 +700,18 @@ async def watch_for_facetime_notifications():
         if "incoming" not in text.lower():
             continue
 
-        # ---- Unified UUID extraction ----
         match = re.search(UUID_REGEX, text)
         if match:
             call_id = match.group(0).replace("-", "")
         else:
-            # Stable fallback
             call_id = "fallback-" + hashlib.sha1(text.encode()).hexdigest()[:12]
 
         now = time.time()
 
-        # ---- Global debounce ----
         if now - last_global < GLOBAL_DEBOUNCE:
             continue
         last_global = now
 
-        # ---- Per-call cooldown ----
         last_event = cooldowns.get(call_id, 0)
         if now - last_event < COOLDOWN:
             logger.debug("Duplicate prevented (cooldown): %s", call_id)
@@ -421,23 +739,38 @@ async def watch_for_facetime_notifications():
 async def startup_event():
     global monitor, outbound
 
+    db_path = IMESSAGE_DB_PATH or str(message_store.default_db_path())
+    await _run_store(message_store.init_db, db_path)
+
+    if not USER_ID:
+        logger.error("IMESSAGE_USER_ID is not set; inbound forward to ORDERFLOW will fail")
+
     loop = asyncio.get_event_loop()
 
     monitor = iMessageMonitor()
     outbound = OutboundMessageSender(monitor.config)
+    _seed_recent_messages(monitor)
 
-    # Register inbound callback
-    # Monitor is always checking the OS to see if a message is recieved
-    # If recieved will send to application
     monitor.start(
         message_callback=lambda msg: loop.create_task(
-            forward_incoming_message(msg)
+            handle_monitor_message(msg)
         )
     )
 
     asyncio.create_task(send_worker(outbound))
+    asyncio.create_task(_edit_poll_loop())
 
     logger.info("iMessage monitor started")
+    logger.info("Message store: %s", db_path)
+    logger.info(
+        "Edit poll every %ss (recent %s messages)",
+        EDIT_POLL_INTERVAL_SECONDS,
+        EDIT_POLL_LIMIT,
+    )
+    logger.info(
+        "Outbound match window: %ss",
+        OUTBOUND_MATCH_WINDOW_SECONDS,
+    )
     logger.info("Outbound queue worker running")
     logger.info("FaceTime watcher started")
     if INBOUND_BATCH_DELAY_SECONDS > 0:
@@ -449,7 +782,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global monitor
+    global monitor, _edit_poll_running
+    _edit_poll_running = False
     await flush_all_inbound_batches()
     try:
         if monitor:
@@ -471,11 +805,15 @@ async def home():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+
 @app.post("/send")
 async def send_message(req: SendRequest):
-    # Recieves message from application and puts it in a queue
-    # macOS is responsible for sending messages
     logger.info("Queued outbound message to %s", req.to)
+    await _run_store(
+        message_store.insert_pending_outbound,
+        peer=req.to,
+        body=req.message,
+    )
     await enqueue_send(req.to, req.message)
     return {"status": "queued", "to": req.to}
 
@@ -494,4 +832,3 @@ if __name__ == "__main__":
         port=port,
         log_level=LOG_LEVEL.lower(),
     )
-    
