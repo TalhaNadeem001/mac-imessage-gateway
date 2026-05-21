@@ -12,6 +12,7 @@ Includes:
 from __future__ import annotations
 
 import os
+import logging
 import asyncio
 import subprocess
 import shutil
@@ -35,6 +36,13 @@ from imessage_monitor.exceptions import OutboundMessageError
 from dotenv import load_dotenv
 load_dotenv()
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("imessage_api")
 
 COOLDOWN = 20  # per-call cooldown
 GLOBAL_DEBOUNCE = 2  # prevent burst duplicates
@@ -198,11 +206,11 @@ async def send_worker(outbound: OutboundMessageSender):
         to, message = await SEND_QUEUE.get()
         try:
             await send_message_via_osascript(to, message)
-            print(f"📤 Sent message to {to}")
+            logger.info("Sent message to %s", to)
         except OutboundMessageError as exc:
-            print(f"❌ OutboundMessageError sending to {to}: {exc}")
+            logger.error("OutboundMessageError sending to %s: %s", to, exc)
         except Exception as exc:
-            print(f"❌ Unexpected send error to {to}: {exc}")
+            logger.exception("Unexpected send error to %s: %s", to, exc)
         finally:
             SEND_QUEUE.task_done()
 
@@ -244,7 +252,7 @@ _inbound_batches_lock = asyncio.Lock()
 
 async def _post_forward_payload(payload: dict, sender: str, audit_messages: list[dict]) -> None:
     await HTTP.post(FWD_URL, json=payload)
-    print(f"➡️ Forwarded inbound message from {sender}")
+    logger.info("Forwarded inbound message from %s", sender)
     from message_audit import store_message
 
     for message in audit_messages:
@@ -273,7 +281,7 @@ async def _forward_messages_now(messages: list[dict], sender: str) -> None:
     try:
         await _post_forward_payload(payload, sender, messages)
     except Exception as e:
-        print(f"⚠️ Failed to forward inbound message: {e}")
+        logger.warning("Failed to forward inbound message: %s", e)
 
 
 async def _flush_sender_batch_after_delay(sender: str) -> None:
@@ -334,9 +342,9 @@ async def forward_incoming_message(message: dict):
 async def restart_messages():
     try:
         subprocess.run(["osascript", "-e", APPLE_SCRIPT], check=True)
-        print("🔄 Messages app restarted")
+        logger.info("Messages app restarted")
     except subprocess.CalledProcessError as e:
-        print(f"⚠️ AppleScript error: {e}")
+        logger.warning("AppleScript error: %s", e)
 
 async def run_auto_decline_applescript():
     process = await asyncio.create_subprocess_exec(
@@ -347,9 +355,9 @@ async def run_auto_decline_applescript():
     stdout, stderr = await process.communicate()
 
     if stdout:
-        print("📟 AppleScript output:", stdout.decode())
+        logger.debug("AppleScript output: %s", stdout.decode())
     if stderr:
-        print("⚠️ AppleScript error:", stderr.decode())
+        logger.warning("AppleScript stderr: %s", stderr.decode())
 
 async def watch_for_facetime_notifications():
     global cooldowns, last_global
@@ -388,12 +396,12 @@ async def watch_for_facetime_notifications():
         # ---- Per-call cooldown ----
         last_event = cooldowns.get(call_id, 0)
         if now - last_event < COOLDOWN:
-            print("⚠️ Duplicate prevented (cooldown):", call_id)
+            logger.debug("Duplicate prevented (cooldown): %s", call_id)
             continue
 
         cooldowns[call_id] = now
 
-        print(f"📞 Incoming FaceTime (ID={call_id}) → restarting Messages")
+        logger.info("Incoming FaceTime (ID=%s) — restarting Messages", call_id)
 
         await restart_messages()
 
@@ -429,12 +437,13 @@ async def startup_event():
 
     asyncio.create_task(send_worker(outbound))
 
-    print("✅ iMessage monitor started")
-    print("🚀 Outbound queue worker running")
-    print("📞 FaceTime watcher started")
+    logger.info("iMessage monitor started")
+    logger.info("Outbound queue worker running")
+    logger.info("FaceTime watcher started")
     if INBOUND_BATCH_DELAY_SECONDS > 0:
-        print(
-            f"📥 Inbound batch delay: {INBOUND_BATCH_DELAY_SECONDS}s per sender"
+        logger.info(
+            "Inbound batch delay: %ss per sender",
+            INBOUND_BATCH_DELAY_SECONDS,
         )
 
 
@@ -466,6 +475,7 @@ async def home():
 async def send_message(req: SendRequest):
     # Recieves message from application and puts it in a queue
     # macOS is responsible for sending messages
+    logger.info("Queued outbound message to %s", req.to)
     await enqueue_send(req.to, req.message)
     return {"status": "queued", "to": req.to}
 
@@ -477,6 +487,11 @@ async def send_message(req: SendRequest):
 if __name__ == "__main__":
     host = os.environ.get("IMESSAGE_HOST", "127.0.0.1")
     port = int(os.environ.get("IMESSAGE_PORT", "8000"))
-    print(f"Starting on http://{host}:{port}")
-    uvicorn.run("app:app", host=host, port=port, log_level="info")
+    logger.info("Starting on http://%s:%s", host, port)
+    uvicorn.run(
+        "app:app",
+        host=host,
+        port=port,
+        log_level=LOG_LEVEL.lower(),
+    )
     
