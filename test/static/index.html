@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>iMessage Gateway Test</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #2a3140;
+      --text: #e8ecf3;
+      --muted: #9aa4b8;
+      --accent: #5b9cff;
+      --ok: #3ecf8e;
+      --bad: #ff6b6b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    h1 { margin: 0 0 .35rem; font-size: 1.15rem; }
+    .meta { color: var(--muted); font-size: .9rem; }
+    .meta code { color: var(--accent); }
+    main {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 1rem;
+      padding: 1rem;
+      min-height: calc(100vh - 84px);
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+    }
+    label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .35rem; }
+    input, textarea, button {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0c0e12;
+      color: var(--text);
+      padding: .6rem .7rem;
+      font: inherit;
+    }
+    textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-size: .85rem; }
+    button {
+      margin-top: .75rem;
+      background: var(--accent);
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.08); }
+    .toolbar {
+      display: flex;
+      gap: .5rem;
+      align-items: center;
+      margin-bottom: .75rem;
+      flex-wrap: wrap;
+    }
+    .toolbar button { width: auto; margin: 0; padding: .45rem .8rem; background: #222836; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: .35rem;
+      padding: .2rem .55rem;
+      border-radius: 999px;
+      font-size: .75rem;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .pill.live { color: var(--ok); border-color: #245f45; }
+    .events { display: flex; flex-direction: column; gap: .75rem; }
+    .event {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #12151c;
+    }
+    .event-head {
+      display: flex;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .65rem .8rem;
+      border-bottom: 1px solid var(--border);
+      font-size: .85rem;
+    }
+    .tag {
+      font-size: .72rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      padding: .15rem .45rem;
+      border-radius: 6px;
+    }
+    .tag.inbound { background: #1d3a2f; color: #7dffc0; }
+    .tag.outbound { background: #1a2d4d; color: #9ec7ff; }
+    .status.ok { color: var(--ok); }
+    .status.bad { color: var(--bad); }
+    pre {
+      margin: 0;
+      padding: .75rem .8rem;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: .78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .empty { color: var(--muted); text-align: center; padding: 2rem 1rem; }
+    .section-title {
+      font-size: .8rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin: .5rem 0 .25rem;
+      padding: 0 .8rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>iMessage Gateway Test Harness</h1>
+    <div class="meta" id="config">Loading config…</div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2 style="margin-top:0;font-size:1rem;">Send via gateway</h2>
+      <form id="send-form">
+        <label for="to">To (phone or email)</label>
+        <input id="to" name="to" placeholder="+15551234567" required />
+
+        <label for="message" style="margin-top:.75rem;">Message</label>
+        <textarea id="message" name="message" placeholder="Hello from test harness" required></textarea>
+
+        <button type="submit">Send to gateway</button>
+      </form>
+      <p class="meta" style="margin:.85rem 0 0;">
+        Posts to <code>/send</code> on the gateway using <code>IMESSAGE_HOST</code>.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="toolbar">
+        <strong>Event log</strong>
+        <span class="pill" id="conn-pill">connecting…</span>
+        <button type="button" id="clear-btn">Clear</button>
+        <button type="button" id="refresh-btn">Refresh</button>
+      </div>
+      <div id="events" class="events">
+        <div class="empty">No events yet. Send a message or receive a webhook.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const eventsEl = document.getElementById("events");
+    const configEl = document.getElementById("config");
+    const connPill = document.getElementById("conn-pill");
+    const seen = new Set();
+
+    function esc(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function pretty(obj) {
+      return esc(JSON.stringify(obj, null, 2));
+    }
+
+    function renderEvent(ev) {
+      if (!ev.id || seen.has(ev.id)) return;
+      seen.add(ev.id);
+
+      const empty = eventsEl.querySelector(".empty");
+      if (empty) empty.remove();
+
+      const dir = ev.direction || "unknown";
+      const ok = ev.ok !== false;
+      const article = document.createElement("article");
+      article.className = "event";
+      article.innerHTML = `
+        <div class="event-head">
+          <div>
+            <span class="tag ${dir}">${dir}</span>
+            <strong>${esc(ev.label || "event")}</strong>
+          </div>
+          <div>
+            <span class="status ${ok ? "ok" : "bad"}">${ok ? "ok" : "error"}</span>
+            <span class="meta">${esc(ev.at || "")}</span>
+          </div>
+        </div>
+        <div class="section-title">Request</div>
+        <pre>${pretty(ev.request || {})}</pre>
+        <div class="section-title">Response</div>
+        <pre>${pretty(ev.response || {})}</pre>
+      `;
+      eventsEl.prepend(article);
+    }
+
+    async function loadConfig() {
+      const res = await fetch("/api/config");
+      const cfg = await res.json();
+      configEl.innerHTML = `
+        Gateway: <code>${esc(cfg.gateway)}</code> ·
+        FWD_URL: <code>${esc(cfg.fwdUrl)}</code> ·
+        Webhook: <code>${esc(cfg.testServer + cfg.webhookPath)}</code>
+        ${cfg.hasApiKey ? " · API key set" : ""}
+      `;
+    }
+
+    async function loadLog() {
+      const res = await fetch("/api/log");
+      const items = await res.json();
+      eventsEl.innerHTML = "";
+      seen.clear();
+      if (!items.length) {
+        eventsEl.innerHTML = '<div class="empty">No events yet.</div>';
+        return;
+      }
+      [...items].reverse().forEach(renderEvent);
+    }
+
+    function connectSSE() {
+      const source = new EventSource("/api/events");
+      source.onopen = () => {
+        connPill.textContent = "live";
+        connPill.classList.add("live");
+      };
+      source.onerror = () => {
+        connPill.textContent = "reconnecting…";
+        connPill.classList.remove("live");
+      };
+      source.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.type === "ping" || data.type === "hello") return;
+          renderEvent(data);
+        } catch (_) {}
+      };
+    }
+
+    document.getElementById("send-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const to = document.getElementById("to").value.trim();
+      const message = document.getElementById("message").value.trim();
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to, message }),
+      });
+      const data = await res.json();
+      renderEvent(data);
+    });
+
+    document.getElementById("clear-btn").addEventListener("click", () => {
+      eventsEl.innerHTML = '<div class="empty">Cleared locally (server log unchanged).</div>';
+      seen.clear();
+    });
+
+    document.getElementById("refresh-btn").addEventListener("click", loadLog);
+
+    loadConfig();
+    loadLog();
+    connectSSE();
+  </script>
+</body>
+</html>
