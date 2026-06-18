@@ -224,6 +224,7 @@ async def enqueue_send(to: str, message: str):
 _known_bodies: dict[str, str] = {}
 _forwarded_guids: set[str] = set()
 _seen_guids: set[str] = set()
+_last_customer_body: dict[str, str] = {}
 _edit_poll_running = False
 
 
@@ -257,6 +258,26 @@ def _sender_key(message: dict) -> Optional[str]:
 
 def _customer_peer(message: dict) -> Optional[str]:
     return _sender_key(message) or message.get("chat_identifier")
+
+
+def _filter_consecutive_repeats(messages: list[dict], customer: str) -> list[dict]:
+    filtered: list[dict] = []
+    prev_body = _last_customer_body.get(customer)
+    for message in messages:
+        body = _message_body(message)
+        if body and body == prev_body:
+            guid = _message_guid(message)
+            logger.info(
+                "Skipping consecutive repeat inbound guid=%s customer=%s",
+                guid,
+                customer,
+            )
+            continue
+        filtered.append(message)
+        prev_body = body
+    if filtered:
+        _last_customer_body[customer] = prev_body
+    return filtered
 
 
 # ================================================================
@@ -445,6 +466,10 @@ async def _forward_messages_now(messages: list[dict], customer: str) -> None:
     if not messages:
         return
 
+    messages = _filter_consecutive_repeats(messages, customer)
+    if not messages:
+        return
+
     for message in messages:
         guid = _message_guid(message)
         if not guid:
@@ -610,6 +635,8 @@ async def handle_monitor_message(message: dict) -> None:
         customer = _customer_peer(message)
         if not guid or not body or not customer:
             return
+
+        _last_customer_body.pop(customer, None)
 
         pending = await _run_store(
             message_store.find_pending_outbound,
