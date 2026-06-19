@@ -229,11 +229,12 @@ _edit_poll_running = False
 
 
 def _message_body(message: dict) -> str:
-    return (
+    raw = (
         message.get("message_text")
         or message.get("decoded_attributed_body")
         or ""
-    ).strip()
+    )
+    return message_store.normalize_body(raw)
 
 
 def _normalize_guid(guid: str) -> str:

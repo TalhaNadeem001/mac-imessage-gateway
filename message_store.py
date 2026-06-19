@@ -65,7 +65,14 @@ def _now_iso() -> str:
 
 
 def _normalize_body(body: str) -> str:
-    return " ".join(body.strip().split())
+    if not body:
+        return ""
+    cleaned = body.replace("\x00", "")
+    cleaned = cleaned.strip("\ufffd").strip()
+    return " ".join(cleaned.split())
+
+
+normalize_body = _normalize_body
 
 
 def _peer_digits(peer: str) -> str:
@@ -134,6 +141,29 @@ def find_pending_outbound(
         for row in rows:
             if peers_match(row["peer"], peer):
                 return dict(row)
+
+        fallback_rows = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE guid IS NULL
+              AND status = 'pending'
+              AND sender = 'cashier'
+              AND created_at >= ?
+            ORDER BY created_at DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        peer_matches = [dict(r) for r in fallback_rows if peers_match(r["peer"], peer)]
+        if not peer_matches:
+            return None
+
+        for row in peer_matches:
+            if _normalize_body(row["body"]) == normalized_body:
+                return row
+
+        if len(peer_matches) == 1:
+            return peer_matches[0]
+
         return None
     except Exception as exc:
         logger.warning("find_pending_outbound failed: %s", exc)
