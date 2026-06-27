@@ -19,3 +19,4 @@ cleanup.py
 dump.py
 db/*
 app.py
+.DS_Store
