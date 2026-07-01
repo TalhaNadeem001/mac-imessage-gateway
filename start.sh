@@ -1,5 +1,5 @@
 #!/bin/bash
-
+cd /Users/macdev2/Documents/git/mac-imessage-gateway || exit 1
 VENV_DIR=".venv"
 CHECKSUM_FILE="$VENV_DIR/req_checksum"
 
@@ -36,4 +36,6 @@ fi
 
 # 5. Run the app
 echo "Launching app:app at $IMESSAGE_HOST:$IMESSAGE_PORT..."
-python3 -m uvicorn app:app --host "$IMESSAGE_HOST" --port "$IMESSAGE_PORT" --reload
+exec python3 -m uvicorn app:app \
+    --host "$IMESSAGE_HOST" \
+    --port "$IMESSAGE_PORT"
