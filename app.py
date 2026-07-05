@@ -17,6 +17,7 @@ import logging
 import asyncio
 import subprocess
 import shutil
+import sqlite3
 from typing import Optional, Annotated
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -99,6 +100,7 @@ OUTBOUND_MATCH_WINDOW_SECONDS = int(
     os.environ.get("OUTBOUND_MATCH_WINDOW_SECONDS", "300")
 )
 IMESSAGE_DB_PATH = os.environ.get("IMESSAGE_DB_PATH")
+CHAT_DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 
 APPLE_SCRIPT = '''
 set appName to "FaceTime"
@@ -259,6 +261,61 @@ def _sender_key(message: dict) -> Optional[str]:
 
 def _customer_peer(message: dict) -> Optional[str]:
     return _sender_key(message) or message.get("chat_identifier")
+
+
+def _lookup_chat_addressed_info(message: dict) -> tuple[Optional[str], Optional[str]]:
+    """Read chat.last_addressed_handle and last_addressed_sim_id from chat.db."""
+    message_id = message.get("message_id")
+    chat_guid = message.get("chat_guid")
+    chat_identifier = message.get("chat_identifier")
+
+    if message_id is None and not chat_guid and not chat_identifier:
+        return None, None
+
+    try:
+        conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
+        try:
+            cur = conn.cursor()
+            if message_id is not None:
+                cur.execute(
+                    """
+                    SELECT c.last_addressed_handle, c.last_addressed_sim_id
+                    FROM chat c
+                    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                    WHERE cmj.message_id = ?
+                    LIMIT 1
+                    """,
+                    (message_id,),
+                )
+            elif chat_guid:
+                cur.execute(
+                    """
+                    SELECT last_addressed_handle, last_addressed_sim_id
+                    FROM chat
+                    WHERE guid = ?
+                    LIMIT 1
+                    """,
+                    (chat_guid,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT last_addressed_handle, last_addressed_sim_id
+                    FROM chat
+                    WHERE chat_identifier = ?
+                    LIMIT 1
+                    """,
+                    (chat_identifier,),
+                )
+            row = cur.fetchone()
+            if not row:
+                return None, None
+            return row[0], row[1]
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("Failed to lookup chat addressed info: %s", exc)
+        return None, None
 
 
 def _filter_consecutive_repeats(messages: list[dict], customer: str) -> list[dict]:
@@ -630,6 +687,16 @@ async def _edit_poll_loop() -> None:
 
 
 async def handle_monitor_message(message: dict) -> None:
+    last_addressed_handle, last_addressed_sim_id = await asyncio.to_thread(
+        _lookup_chat_addressed_info, message
+    )
+    print(
+        "Received message:",
+        {
+            "last_addressed_handle": last_addressed_handle,
+            "last_addressed_sim_id": last_addressed_sim_id,
+        },
+    )
     if message.get("is_from_me"):
         guid = _message_guid(message)
         body = _message_body(message)
