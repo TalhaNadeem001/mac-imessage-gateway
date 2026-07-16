@@ -1,5 +1,4 @@
 #!/bin/bash
-cd /Users/macdev2/Documents/git/mac-imessage-gateway || exit 1
 VENV_DIR=".venv"
 CHECKSUM_FILE="$VENV_DIR/req_checksum"
 

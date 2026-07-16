@@ -67,9 +67,11 @@ def _now_iso() -> str:
 def _normalize_body(body: str) -> str:
     if not body:
         return ""
+    # print(f"Before normalization: {body}")
     cleaned = body.replace("\x00", "")
     cleaned = cleaned.strip("\ufffd").strip()
-    return " ".join(cleaned.split())
+    # print(f"After normalization: {cleaned}")
+    return cleaned
 
 
 normalize_body = _normalize_body
