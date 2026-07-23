@@ -1049,6 +1049,53 @@ async def home():
     }
 
 
+@app.post("/send/v2")
+async def send_message_v2(req: SendRequest):
+    if not shutil.which("osascript"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="osascript not found. This sender requires macOS.",
+        )
+
+    to = _escape_applescript_string(req.to)
+    message = _escape_applescript_string(req.message)
+    script = f"""
+tell application "Messages" to activate
+delay 0.5
+tell application "System Events"
+    tell process "Messages"
+        keystroke "n" using command down
+        delay 0.4
+        keystroke "{to}"
+        delay 0.4
+        key code 36
+        delay 0.4
+        key code 48
+        delay 0.3
+        keystroke "{message}"
+        delay 0.3
+        key code 36
+    end tell
+end tell
+"""
+    process = await asyncio.create_subprocess_exec(
+        "osascript",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate(script.encode("utf-8"))
+    if process.returncode != 0:
+        details = (stderr or stdout or b"").decode("utf-8", "ignore").strip()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=details or f"osascript failed with exit code {process.returncode}",
+        )
+
+    logger.info("Sent message via UI automation to %s", req.to)
+    return {"status": "sent", "to": req.to}
+
+
 @app.post("/send")
 async def send_message(req: SendRequest):
     logger.info("Queued outbound message to %s", req.to)
